@@ -1,0 +1,105 @@
+Perfecto, con esa salida ya se ve claramente qué pasa.
+
+Resumen rápido:
+Tu DNS spoofer SÍ está funcionando, está modificando las respuestas, pero la IP a la que rediriges no es alcanzable desde la máquina víctima. Por eso el navegador dice que no puede alcanzar el destino.
+
+Voy por partes.
+	1.	Lo que nos dice la salida
+
+Veo esto:
+	•	Dominios configurados:
+	•	facebook.com -> 192.168.64.8
+	•	www.facebook.com -> 192.168.64.8
+	•	google.com -> 192.168.138.8
+	•	www.google.com -> 192.168.138.8
+	•	etc
+
+Y además:
+	•	Muchas líneas tipo:
+[DEBUG] Consulta DNS detectada: www.google.com
+[Modificado]: IP / UDP / DNS Ans 198.18.160.1 -> IP / UDP / DNS Ans 192.168.138.8
+
+Eso significa:
+	•	La víctima está preguntando por www.google.com.
+	•	Tu script intercepta la respuesta real y la cambia para que el dominio apunte a 192.168.138.8.
+	•	O sea: a nivel DNS todo bien, el spoofing está ocurriendo.
+
+El problema ya no es el script de DNS, sino que cuando la víctima intenta conectar a 192.168.138.8, la red o el servicio web no responden.
+	2.	Por qué la víctima dice que “no puede alcanzar el destino”
+
+Hay tres causas típicas para ese mensaje:
+	1.	La IP que estás usando como rdata (192.168.138.8) no pertenece a ninguna interfaz que la víctima pueda alcanzar.
+	•	Puede ser una IP de otra red.
+	•	Puede ser una IP que existe solo en el host físico, pero no es visible para la VM de la víctima.
+	•	Puede que simplemente esa IP no esté asignada a ninguna máquina.
+	2.	El servidor web está corriendo solo en localhost (127.0.0.1) y no en la IP de la interfaz de red.
+Ejemplo clásico:
+	•	Levantas el servidor con algo como
+python3 -m http.server 80
+que suele escuchar en 0.0.0.0 en versiones modernas, pero algunos servidores se levantan solo en 127.0.0.1.
+	•	Desde otra máquina, si intentas http://192.168.x.x, no responde.
+	3.	Firewall o iptables bloqueando el tráfico hacia el puerto 80 o 443 en esa IP.
+	4.	Lo primero que debes comprobar
+
+En la máquina atacante (donde corre el spoofer), haz:
+	1.	Ver tu IP real en la interfaz que comparte red con la víctima:
+En Linux:
+
+ip a
+
+Busca algo tipo:
+	•	192.168.64.7
+	•	192.168.64.10
+	•	10.0.2.15
+Esa es la IP que realmente ve la víctima en esa red, esa es la IP que debes usar en el spoof, no 192.168.138.8 a lo loco.
+
+	2.	Desde la máquina víctima, comprueba si puede llegar a la IP que quieres usar en el spoof:
+
+ping 192.168.64.8
+
+Si el ping falla, esa IP no es alcanzable.
+Hasta que la víctima no pueda hacer ping, aunque el DNS la apunte ahí, nunca va a cargar la página.
+
+	3.	Confirma que el servidor web escucha en la IP correcta
+En la máquina atacante, si estás usando por ejemplo un http.server:
+
+sudo python3 -m http.server 80 --bind 0.0.0.0
+
+Eso garantiza que escucha en todas las interfaces, no solo en localhost.
+Luego verifica:
+
+ss -tulpn | grep :80
+
+Y mira que esté escuchando en 0.0.0.0:80 o en la IP de la red, no solo en 127.0.0.1:80.
+
+	4.	Ajuste importante en el código: solo tocar consultas tipo A
+
+En tu salida se ve:
+
+[Modificado]: IP / UDP / DNS Ans 2607:f8b0:4008:80b::2004 -> IP / UDP / DNS Ans 192.168.138.8
+
+Eso huele a que estás modificando respuestas AAAA (IPv6) y metiendo una IPv4 ahí. Algunos sistemas pasan de esa respuesta porque el tipo no cuadra, y se pueden poner raros con el fallback a IPv4.
+
+Es mejor que solo modifiques consultas de tipo A (qtype 1) y dejes las AAAA en paz para que el sistema caiga al A normal.
+
+Aquí tienes un código completo ajustado con todo esto en mente:
+
+
+
+	5.	Checklist concreto para que te funcione de verdad
+
+Haz esto en este orden:
+	1.	En la máquina atacante:
+	•	Ejecuta ip a y anota la IP que comparte red con la víctima, por ejemplo 192.168.64.7.
+	•	Pon esa IP en SPOOF_IP en el script.
+	2.	Vuelve a levantar las reglas de iptables o deja que el script lo haga.
+	3.	Levanta el servidor web en la máquina atacante escuchando en esa IP:
+	•	Lo más fácil para probar:
+sudo python3 -m http.server 80 --bind 0.0.0.0
+	4.	En la máquina víctima:
+	•	Primero prueba ping 192.168.64.7 (cambia por la IP real que pusiste).
+Si aquí falla, no importa el DNS, no llegará nunca.
+	•	Luego prueba nslookup google.com y confirma que responde con esa IP.
+	•	Por último, entra en el navegador a https://www.google.com y mira qué pasa.
+
+Si tras hacer todo esto sigues viendo el mensaje de “no puede alcanzar el destino”, el siguiente paso es mirar juntos la IP real de atacante, la IP de la víctima y el modo de red de tus máquinas (NAT, puente, etc.). Pero a nivel de código, con lo que muestras, el DNS ya está siendo modificado correctamente y el problema está en la ruta o en el servidor.

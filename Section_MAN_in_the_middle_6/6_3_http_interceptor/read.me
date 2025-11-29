@@ -1,0 +1,11 @@
+
+
+Este código solo funciona si:
+	•	lo ejecutas como root:
+sudo python3 mitm_http_inject.py
+	•	tienes reglas iptables apuntando a la cola 1, por ejemplo, para tráfico HTTP saliente de la máquina:
+iptables -I OUTPUT -p tcp –dport 80 -j NFQUEUE –queue-num 1
+iptables -I INPUT  -p tcp –sport 80 -j NFQUEUE –queue-num 1
+	•	el tráfico es realmente HTTP en texto plano (no HTTPS) y la página que estás tocando todavía contiene la frase Copyleft 1985-2021.
+
+Cualquier cosa, si quieres, en el siguiente paso podemos añadir una versión que inyecte cuando detecte, por ejemplo, una etiqueta concreta en HTML, o que solo haga log sin modificar para que veas claro qué está pasando en tu laboratorio.

@@ -1,0 +1,8 @@
+pip3 install rich
+pip3 install tqdm
+pip3 install scapy 
+pip3 install logging
+pip3 install smb 
+pip3 install python-libpcap
+pip3 install pypcap
+pip3 install pysmb

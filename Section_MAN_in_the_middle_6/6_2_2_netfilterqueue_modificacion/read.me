@@ -1,0 +1,184 @@
+Para este proyecto instalamos las dependencias en el sistema kali linux puesto que tiene problema cuando lo instlas en un entorno vistual
+sudo apt update
+sudo apt install -y python3-netfilterqueue libnetfilter-queue-dev libnfnetlink-dev
+sudo apt update
+sudo apt install -y python3-scapy
+
+
+Te resumo la idea: tu máquina perdió conexión casi seguro por cómo estás usando NetfilterQueue + iptables, y por un fallo en el script que hace que los paquetes se queden “congelados” en la cola en lugar de ser aceptados y reenviados.
+
+Voy por partes.
+
+⸻
+
+1. Qué está haciendo este script con la red
+
+Tu código:
+
+from netfilterqueue import NetfilterQueue
+from scapy.all import IP, ICMP, Raw
+
+Para que esto funcione, tú tuviste que hacer algo tipo:
+
+iptables -I OUTPUT -j NFQUEUE --queue-num 1
+iptables -I INPUT  -j NFQUEUE --queue-num 1
+# o en FORWARD, PREROUTING, etc.
+
+Es decir:
+	•	Todo el tráfico que matchea esa regla se manda a la cola 1.
+	•	NetfilterQueue se encarga de entregarle esos paquetes a tu script en Python.
+	•	En tu función intercept, tú decides si los aceptas (packet.accept()), los rechazas o los modificas.
+
+Si:
+	•	El script se cuelga,
+	•	O se cierra con error,
+	•	O se detiene y las reglas iptables se quedan activas,
+
+los paquetes siguen yendo a NFQUEUE, pero nadie los procesa. Resultado: tu Ubuntu deja de tener red (los paquetes nunca salen ni entran).
+
+⸻
+
+2. Lo que hace tu función intercept
+
+def intercept(packet):
+    payload = packet.get_payload()
+    spkt = IP(payload)
+    
+    print("Ha llegado un nuevo paquete")
+    
+    if spkt.haslayer(ICMP):
+        print("Datos originales: ", str(spkt[Raw].load))
+        
+        spkt[Raw].load = "attacker value"
+        spkt.show()
+        
+        spkt = recalculate(spkt)
+    
+    packet.set_payload(bytes(spkt))
+    packet.accept()
+
+En teoría:
+	•	Convierte el payload en un paquete IP de Scapy.
+	•	Si es ICMP:
+	•	Muestra el payload original.
+	•	Cambia el Raw.load.
+	•	Recalcula longitud y checksums.
+	•	Luego vuelve a meter el paquete (modificado o no) y lo acepta.
+
+Hasta aquí, todo bien… salvo por varios detalles que pueden romper el script y con ello la conexión.
+
+⸻
+
+3. Errores que pueden tumbarte la conexión
+
+Aquí están los puntos críticos:
+
+a) spkt[Raw] sin comprobar que exista realmente
+
+if spkt.haslayer(ICMP):
+    print("Datos originales: ", str(spkt[Raw].load))
+
+Que el paquete tenga capa ICMP no garantiza que tenga capa Raw. Debería ser algo más defensivo:
+
+if spkt.haslayer(ICMP) and spkt.haslayer(Raw):
+    ...
+
+Si llega un ICMP sin Raw, la línea spkt[Raw].load puede lanzar excepción, tu script se rompe y la cola NFQUEUE se queda sin consumidor. De nuevo: iptables sigue mandando paquetes a la cola… y no hay quién los acepte → adiós internet.
+
+⸻
+
+b) Asignar un string normal en vez de bytes
+
+spkt[Raw].load = "attacker value"
+
+En Scapy (y en Python 3 en general), los payloads suelen ser bytes, no str.
+
+Luego, en recalculate haces:
+
+pkt = pkt.__class__(bytes(pkt))
+
+Si dentro del paquete hay un Raw.load que es un str en vez de bytes, bytes(pkt) puede lanzar un error de tipo. Resultado: excepción → script muerto → cola bloqueada → sin conexión.
+
+Deberías usar:
+
+spkt[Raw].load = b"attacker value"
+
+
+⸻
+
+c) Cualquier excepción dentro de intercept
+
+No tienes un bloque try/except dentro de intercept. Eso significa que:
+	•	Si pasa cualquier error mientras procesas un paquete,
+	•	El script termina,
+	•	Pero las reglas iptables siguen redirigiendo paquetes a NFQUEUE,
+	•	Como no hay proceso leyendo la cola, el kernel los descarta.
+
+Esto explica perfectamente por qué “de repente” tu Ubuntu se quedó sin conexión después de ejecutar el script.
+
+⸻
+
+4. Relación con el script anterior de ARP Spoofing
+
+En el código de ARP Spoofing:
+	•	Activabas ip_forward.
+	•	Tu máquina podía actuar como router/puente entre víctima y gateway.
+	•	Si encima añades reglas iptables con NFQUEUE en la cadena FORWARD para interceptar tráfico que estás encaminando, entonces:
+	•	Tu equipo no solo está en el medio,
+	•	También está decidiendo qué pasa con cada paquete.
+
+Si ese script que procesa la cola falla, toda la comunicación que pasa a través de tu máquina (víctima ↔ gateway) se congela. Eso puede hacer que:
+	•	La víctima pierda conexión,
+	•	O tu propio Ubuntu, si también metiste INPUT/OUTPUT en la cola.
+
+⸻
+
+5. Cómo evitar que vuelva a pasar
+
+Algunos cambios que te van a dar mucha estabilidad:
+	1.	Asegura que siempre aceptas paquetes aunque haya error:
+
+def intercept(packet):
+    try:
+        payload = packet.get_payload()
+        spkt = IP(payload)
+
+        print("Ha llegado un nuevo paquete")
+
+        if spkt.haslayer(ICMP) and spkt.haslayer(Raw):
+            print("Datos originales: ", spkt[Raw].load)
+            spkt[Raw].load = b"attacker value"
+            spkt = recalculate(spkt)
+
+        packet.set_payload(bytes(spkt))
+        packet.accept()
+    except Exception as e:
+        print("Error en intercept:", e)
+        # Muy importante: no bloquear el tráfico si hay error
+        packet.accept()
+
+	2.	Limita las reglas iptables solo a lo que quieres tocar (por ejemplo, ICMP):
+
+sudo iptables -I OUTPUT -p icmp -j NFQUEUE --queue-num 1
+sudo iptables -I INPUT  -p icmp -j NFQUEUE --queue-num 1
+
+	3.	Cuando termines de jugar con NFQUEUE, elimina las reglas o limpia iptables:
+
+sudo iptables -D OUTPUT -p icmp -j NFQUEUE --queue-num 1
+sudo iptables -D INPUT  -p icmp -j NFQUEUE --queue-num 1
+# o, en un entorno de laboratorio, incluso:
+# sudo iptables -F
+
+	4.	Revisa siempre si ip_forward está en el estado que quieres, sobre todo si estás combinando esto con ARP Spoofing / MITM.
+
+⸻
+
+6. Resumen corto
+
+Tu Ubuntu perdió la conexión porque:
+	•	Redirigiste tráfico a una cola de NetfilterQueue mediante iptables.
+	•	Tu script, al procesar paquetes (ICMP + Raw + cambio de payload a string), probablemente lanzó una excepción y se detuvo.
+	•	Las reglas iptables siguieron activas, enviando paquetes a la cola, pero ya no había proceso leyéndolos.
+	•	El kernel terminó descartando ese tráfico, dejando tu máquina sin red.
+
+Si quieres, en el siguiente mensaje te puedo armar un mini README explicando el flujo “iptables → NFQUEUE → Python → accept” y cómo probarlo de forma segura sin quedarte sin conexión.

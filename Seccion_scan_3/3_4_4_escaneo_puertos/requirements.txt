@@ -1,0 +1,4 @@
+pip3 install rich
+pip3 install tqdm
+pip3 install scapy 
+pip3 install logging
